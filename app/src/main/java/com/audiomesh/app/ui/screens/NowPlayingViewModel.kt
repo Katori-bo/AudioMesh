@@ -15,58 +15,56 @@ import kotlinx.coroutines.flow.asStateFlow
 //
 //  Single source of truth for:
 //    • The currently playing Song + role + mode
-//    • The upcoming queue
-//    • Receiver session metadata (senderIp, role, active flag)
-//    • Playback progress (polled from SenderService binder)
+//    • The manual queue
+//    • Receiver session metadata (senderIp, role, isActive)
+//    • Playback progress (polled from SenderService binder in AppNavigation)
 //
-//  skipNext / skipPrev crash fix
-//  ─────────────────────────────
-//  Root cause: Song.equals() compares ALL fields including remoteArtUrl,
-//  remoteArtist, remoteAlbum.  The Song in _song may have been enriched with
-//  remote metadata after being added to songList, so indexOf() always returns
-//  -1 in that case — making next/prev always jump to index 0 (first song).
+//  Session lifecycle contract:
+//    • clearReceiver() is called ONLY when the user explicitly leaves the mesh
+//      (LEAVE MESH button → ReceiverMainScreen → AppNavigation.onLeave lambda).
+//    • It is NEVER called on back-press. Back-press just pops the nav stack
+//      while isReceiverActive stays true, keeping the MiniPlayerBar visible.
 //
-//  Fix: match songs by ID (stable Long), not by structural equality.
-//
-//  Secondary crash: if the SenderService binder is null AND mode is MESH,
-//  startForegroundService is called with localOnly=false, which starts the
-//  sender without a detected hotspot IP and causes the native engine to crash
-//  on bind().  Fix: guard with the current mode and skip the restart when
-//  the service is expected to be running but the binder is transiently null.
+//  Auto-advance guard (MESH mode):
+//    • When a track ends in MESH mode, skipNext() is called from checkAutoAdvance.
+//    • In MESH mode, swapOrRestartService() calls binder.swapTrack() if the
+//      binder is live, or does nothing if it isn't (the sender screen shows
+//      GO LIVE and the user re-initiates manually).
+//    • We do NOT restart the service in MESH mode when the binder is null —
+//      that would start the sender without a hotspot IP and crash the engine.
 // ─────────────────────────────────────────────────────────────────────────────
 
 class NowPlayingViewModel : ViewModel() {
 
-    // Survives navigation back via miniplayer — prevents swapTrack from
-    // firing again when SenderMainScreen is recreated for the same song.
+    // Guards against duplicate swapTrack calls when returning via MiniPlayerBar.
+    // Reset to -1L in select() so every fresh track selection always swaps.
     var lastSwappedSongId: Long = -1L
 
-    // ── Queue State ──────────────────────────────────────────────────────────
+    // ── Queue ────────────────────────────────────────────────────────────────
     private val _queue = MutableStateFlow<List<Song>>(emptyList())
     val queue: StateFlow<List<Song>> = _queue.asStateFlow()
 
     private val _queueIndex = MutableStateFlow(0)
     val queueIndex: StateFlow<Int> = _queueIndex.asStateFlow()
 
-    // ── Playback State ───────────────────────────────────────────────────────
-    private val _song  = MutableStateFlow<Song?>(null)
+    // ── Playback state ───────────────────────────────────────────────────────
+    private val _song = MutableStateFlow<Song?>(null)
     val song: StateFlow<Song?> = _song.asStateFlow()
 
-    private val _role  = MutableStateFlow(SenderRole.FULL)
+    private val _role = MutableStateFlow(SenderRole.FULL)
     val role: StateFlow<SenderRole> = _role.asStateFlow()
 
-    private val _mode  = MutableStateFlow(SenderMode.MESH)
+    private val _mode = MutableStateFlow(SenderMode.MESH)
     val mode: StateFlow<SenderMode> = _mode.asStateFlow()
 
     private val _progressMs = MutableStateFlow(0L)
     val progressMs: StateFlow<Long> = _progressMs.asStateFlow()
 
-    // ── Song list (set from LibraryScreen on load) ───────────────────────────
-    // Kept as a plain list — no need to expose as StateFlow since the
-    // Composable doesn't observe it directly.
+    // Internal song list — used for next/prev navigation.
+    // Not exposed as StateFlow; Library sets it via setSongList().
     private var songList: List<Song> = emptyList()
 
-    // ── Receiver session tracking ────────────────────────────────────────────
+    // ── Receiver session ─────────────────────────────────────────────────────
     private val _receiverSenderIp = MutableStateFlow<String?>(null)
     val receiverSenderIp: StateFlow<String?> = _receiverSenderIp.asStateFlow()
 
@@ -76,12 +74,15 @@ class NowPlayingViewModel : ViewModel() {
     private val _isReceiverActive = MutableStateFlow(false)
     val isReceiverActive: StateFlow<Boolean> = _isReceiverActive.asStateFlow()
 
+    // Called when user joins a mesh (LibraryScreen / NearbyMeshBanner)
     fun setReceiverActive(senderIp: String, role: String) {
         _receiverSenderIp.value = senderIp
         _receiverRole.value     = role
         _isReceiverActive.value = true
     }
 
+    // Called ONLY from the LEAVE MESH path (AppNavigation.onLeave lambda).
+    // Do NOT call this on back-press.
     fun clearReceiver() {
         _receiverSenderIp.value = null
         _isReceiverActive.value = false
@@ -111,7 +112,7 @@ class NowPlayingViewModel : ViewModel() {
     }
 
     fun clearQueue() {
-        _queue.value  = emptyList()
+        _queue.value      = emptyList()
         _queueIndex.value = 0
     }
 
@@ -124,26 +125,31 @@ class NowPlayingViewModel : ViewModel() {
     // ── Playback control ─────────────────────────────────────────────────────
 
     fun select(song: Song, role: SenderRole, mode: SenderMode = SenderMode.MESH) {
-        autoAdvanceFired = false
-        lastSwappedSongId = -1L   // reset so the new song always goes through swapTrack
-        _song.value  = song
-        _role.value  = role
-        _mode.value  = mode
+        autoAdvanceFired  = false
+        lastSwappedSongId = -1L   // always reset so the new song always triggers swapTrack
+        _song.value       = song
+        _role.value       = role
+        _mode.value       = mode
         _progressMs.value = 0L
-        clearReceiver()
+        clearReceiver()           // selecting a song as sender ends any receiver session
     }
+
     fun updateProgress(context: Context, ms: Long) {
         _progressMs.value = ms
         val currentSong = _song.value ?: return
         checkAutoAdvance(context, ms, currentSong.durationMs)
     }
 
-    // Guard flag — prevents checkAutoAdvance firing more than once
-    // per track. Reset in skipNext and select.
     private var autoAdvanceFired = false
 
     private fun checkAutoAdvance(context: Context, positionMs: Long, durationMs: Long) {
         if (autoAdvanceFired) return
+        // Only auto-advance in LOCAL mode — in MESH mode the sender engine
+        // loops the track automatically (see SenderEngine streaming loop).
+        // Auto-advancing in MESH mode while the engine is already looping
+        // causes a double-swap: the engine restarts the track AND swapTrack()
+        // is called simultaneously, creating a race that crashes the encoder.
+        if (_mode.value == SenderMode.MESH) return
         if (durationMs > 0 && positionMs >= durationMs - 500) {
             if (_queue.value.isNotEmpty()) {
                 autoAdvanceFired = true
@@ -151,6 +157,7 @@ class NowPlayingViewModel : ViewModel() {
             }
         }
     }
+
     fun clearNowPlaying() {
         _song.value       = null
         _progressMs.value = 0L
@@ -163,18 +170,18 @@ class NowPlayingViewModel : ViewModel() {
     // ── Skip next ────────────────────────────────────────────────────────────
     //
     //  Priority:
-    //    1. Play the first song in the manual queue.
-    //    2. Advance to the next song in songList (by ID match, not equals()).
-    //    3. Wrap around to the first song in songList.
-    //    4. No-op if songList is also empty.
+    //    1. First song in manual queue
+    //    2. Next song in songList (matched by ID, not by equals())
+    //    3. Wrap to first song in songList
+    //    4. No-op if both are empty
 
     fun skipNext(context: Context) {
-        autoAdvanceFired = false   // reset so next track can auto-advance too
+        autoAdvanceFired = false
         val q = _queue.value
         if (q.isNotEmpty()) {
             val next = q.first()
-            _queue.value = q.drop(1)
-            _song.value = next
+            _queue.value      = q.drop(1)
+            _song.value       = next
             _progressMs.value = 0L
             swapOrRestartService(context, next)
             return
@@ -183,12 +190,11 @@ class NowPlayingViewModel : ViewModel() {
         val current = _song.value ?: return
         if (songList.isEmpty()) return
 
-        // FIX: match by ID so enriched remote-metadata fields don't break indexOf
         val idx  = songList.indexOfFirst { it.id == current.id }
         val next = when {
-            idx < 0                    -> songList.first()           // not found → wrap
-            idx < songList.lastIndex   -> songList[idx + 1]          // normal advance
-            else                       -> songList.first()           // end of list → wrap
+            idx < 0                  -> songList.first()
+            idx < songList.lastIndex -> songList[idx + 1]
+            else                     -> songList.first()
         }
         _song.value       = next
         _progressMs.value = 0L
@@ -203,8 +209,8 @@ class NowPlayingViewModel : ViewModel() {
 
         val idx  = songList.indexOfFirst { it.id == current.id }
         val prev = when {
-            idx <= 0  -> songList.last()     // first song or not found → wrap to end
-            else      -> songList[idx - 1]
+            idx <= 0 -> songList.last()
+            else     -> songList[idx - 1]
         }
         _song.value       = prev
         _progressMs.value = 0L
@@ -212,26 +218,20 @@ class NowPlayingViewModel : ViewModel() {
     }
 
     // ── Service management ───────────────────────────────────────────────────
-    //
-    //  FIX: swapTrack preferred — avoids the 10 s stop/restart latency.
-    //
-    //  Cold-start guard: if the binder is null AND mode is MESH, the service
-    //  only when mode == MESH; for LOCAL we use localOnly=true.
-    //  This prevents the native SenderEngine crash that occurred when
-    //  startForegroundService was called with localOnly=false before the
-    //  Wi-Fi hotspot IP had been detected.
 
     private fun swapOrRestartService(context: Context, song: Song) {
-        if (SenderService.getBinder() != null) {
-            // Binder is live — SenderMainScreen.LaunchedEffect(song.id) already
-            // calls swapTrack() when _song.value changes. Calling it here too
-            // causes two concurrent senderSwapTrack() calls on the native engine
-            // → race condition → crash. Let the LaunchedEffect own the swap.
+        val binder = SenderService.getBinder()
+        if (binder != null) {
+            // Binder is live — SenderMainScreen.LaunchedEffect(song.id) owns
+            // the actual swapTrack() call. Calling it here too would cause two
+            // concurrent senderSwapTrack() calls → race condition → crash.
+            // Just return and let the LaunchedEffect handle it.
             return
         }
 
-        // No binder — service not running. Only auto-restart in LOCAL mode.
-        // In MESH mode the sender screen will show GO LIVE for the user to re-initiate.
+        // No binder — service not running.
+        // Only auto-restart in LOCAL mode. In MESH mode the user sees GO LIVE
+        // and initiates manually (we can't detect the hotspot IP here).
         if (_mode.value == SenderMode.LOCAL) {
             context.startForegroundService(
                 Intent(context, SenderService::class.java).apply {
@@ -244,7 +244,6 @@ class NowPlayingViewModel : ViewModel() {
         }
     }
 
-    // Keep old name for any call sites that already use it
     @Suppress("unused")
     private fun restartService(context: Context, song: Song) = swapOrRestartService(context, song)
 }

@@ -18,26 +18,38 @@ public class ReceiverService extends Service {
 
     private long nativeHandle = 0;
 
+    // ── explicitStop_ — set ONLY via binder.stopAndLeave() ───────────────────
+    // Gates whether onDestroy() tears down the native engine.
+    //
+    // The two valid stop paths are:
+    //   1. User presses LEAVE MESH → binder.stopAndLeave() → sets flag → stopSelf()
+    //   2. App finishes → AudioMeshActivity.onDestroy(isFinishing=true) calls
+    //      binder.stopAndLeave() before stopService(), so flag is already true.
+    //
+    // Calling stopService() from the UI directly (without the binder) will NOT
+    // stop the audio — the engine keeps running. This is intentional: it prevents
+    // accidental engine teardown on navigation events.
     private boolean explicitStop_ = false;
 
     // ── WakeLock — keeps CPU alive when screen turns off ──────────────────────
     private PowerManager.WakeLock wakeLock_;
 
-    // ── AudioFocus — plays nicely with phone calls, other apps ────────────────
+    // ── AudioFocus ────────────────────────────────────────────────────────────
     private AudioManager      audioManager_;
     private AudioFocusRequest audioFocusRequest_;
     private boolean           audioFocusHeld_ = false;
 
     private final Handler hwPollHandler_ = new Handler(Looper.getMainLooper());
     private boolean       hwLatencySaved_ = false;
+
     private static ReceiverService sInstance = null;
 
     public static LocalBinder getBinder() {
         return sInstance != null ? (LocalBinder) sInstance.binder : null;
     }
-// ─────────────────────────────────────────────────────────────────────────────    // ─────────────────────────────────────────────────────────────────────────
 
-    // ── Binder — lets MainActivity push live latency updates ──────────────────
+    // ── Binder ────────────────────────────────────────────────────────────────
+
     public class LocalBinder extends Binder {
 
         public void setLatencyMs(int ms) {
@@ -75,6 +87,10 @@ public class ReceiverService extends Service {
             return NativeEngine.receiverGetAssignedRole(nativeHandle);
         }
 
+        // ── switchSender ──────────────────────────────────────────────────────
+        // Triggers rehandshakeInPlace_ in ReceiverEngine — seamless reconnect
+        // without tearing down the AAudio stream. Used for both "switch sender"
+        // and "role change" flows. Pass "" to auto-discover.
         public void switchSender(String newIP) {
             if (nativeHandle != 0)
                 NativeEngine.receiverSwitchSender(nativeHandle, newIP);
@@ -84,7 +100,6 @@ public class ReceiverService extends Service {
             if (nativeHandle == 0) return "";
             return NativeEngine.receiverGetConnectionStatus(nativeHandle);
         }
-        // After getConnectionStatus():
 
         public void reconnect(String newIp) {
             if (nativeHandle != 0)
@@ -97,54 +112,67 @@ public class ReceiverService extends Service {
             return status != null && status.startsWith("HANDSHAKE_OK");
         }
 
-        public void leaveAndStop() {
+        // ── stopAndLeave — THE correct way to stop from the UI ────────────────
+        // Sets explicitStop_ = true so onDestroy() tears down the native engine,
+        // then calls stopSelf() to trigger the service lifecycle.
+        //
+        // Do NOT call stopService() from the UI directly — it bypasses this flag
+        // and the engine keeps running (audio keeps playing).
+        public void stopAndLeave() {
+            Log.i(TAG, "stopAndLeave() called — tearing down receiver");
             explicitStop_ = true;
             stopSelf();
+        }
+
+        // Legacy alias — kept so MainActivity.java still compiles
+        public void leaveAndStop() {
+            stopAndLeave();
         }
 
         public String getTrackTitle() {
             if (nativeHandle == 0) return "";
             return NativeEngine.receiverGetTrackTitle(nativeHandle);
         }
+
         public String getTrackArtist() {
             if (nativeHandle == 0) return "";
             return NativeEngine.receiverGetTrackArtist(nativeHandle);
         }
+
         public String getPaletteHex1() {
             if (nativeHandle == 0) return "";
             return NativeEngine.receiverGetPaletteHex1(nativeHandle);
         }
+
         public String getPaletteHex2() {
             if (nativeHandle == 0) return "";
             return NativeEngine.receiverGetPaletteHex2(nativeHandle);
         }
+
         public long getPositionMs() {
             if (nativeHandle == 0) return 0L;
             return NativeEngine.receiverGetCurrentPositionMs(nativeHandle);
         }
+
         public long getDurationMs() {
             if (nativeHandle == 0) return 0L;
             return NativeEngine.receiverGetTrackDurationMs(nativeHandle);
         }
-
     }
-
 
     private final IBinder binder = new LocalBinder();
 
-    @Override public IBinder onBind(Intent intent) { return binder; }
+    @Override
+    public IBinder onBind(Intent intent) { return binder; }
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     @Override
-        public void onCreate() {
+    public void onCreate() {
         super.onCreate();
         sInstance = this;
         createNotificationChannel();
-        // ── Acquire WakeLock ──────────────────────────────────────────────────
-        // PARTIAL_WAKE_LOCK: keeps CPU + network alive, screen can turn off.
-        // Essential for the receiver — without it Android kills the network
-        // thread within ~60s of the screen turning off.
+
         PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
         wakeLock_ = pm.newWakeLock(
                 PowerManager.PARTIAL_WAKE_LOCK,
@@ -153,7 +181,6 @@ public class ReceiverService extends Service {
         wakeLock_.acquire();
         Log.i(TAG, "WakeLock acquired");
 
-        // ── Request AudioFocus ────────────────────────────────────────────────
         audioManager_ = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
         requestAudioFocus();
     }
@@ -162,11 +189,15 @@ public class ReceiverService extends Service {
     public int onStartCommand(Intent intent, int flags, int startId) {
         // Never run receiver on the same device as an active sender
         if (SenderService.getBinder() != null) {
-            Log.w(TAG, "SenderService is running on this device — refusing to start receiver");
+            Log.w(TAG, "SenderService is running — refusing to start receiver");
             stopSelf();
             return START_NOT_STICKY;
         }
-        explicitStop_ = false;   // ← reset on every start/restart
+
+        // Reset on every fresh start so a restarted service doesn't carry
+        // over a stale true value from a previous session.
+        explicitStop_ = false;
+
         startForeground(NOTIF_ID, buildNotification("Receiver starting…"));
 
         String role      = intent != null ? intent.getStringExtra("role")        : "full";
@@ -194,46 +225,32 @@ public class ReceiverService extends Service {
             } else {
                 updateNotification("Discovering sender… role=" + finalRole);
 
-                // Check if we already have a reliable calibration or saved value
                 hwLatencySaved_ = (LatencyPrefs.getSavedHwLatency(this) > 0
                         || LatencyPrefs.hasCalibValue(this));
 
-                // If this is a first-boot (no saved data), start the geometry poll
                 if (!hwLatencySaved_) {
                     scheduleHwLatencyPoll();
                 }
             }
         }, "ReceiverStartThread").start();
 
-        return START_STICKY;
+        // ── START_NOT_STICKY ──────────────────────────────────────────────────
+        // Do NOT restart automatically if killed by Android.
+        //
+        // WHY: START_STICKY caused a reconnect storm on low-RAM devices.
+        // When Android killed the service under memory pressure, it restarted
+        // it immediately. The restart tore down and rebuilt the native engine,
+        // which the sender saw as a dead client drop. The receiver reconnected.
+        // Android killed it again. This loop made the audio completely inaudible.
+        //
+        // With START_NOT_STICKY the service stops cleanly when killed. The
+        // MiniPlayerBar dims (isConnected() returns false) and the user can tap
+        // it to rejoin. This is far better than invisible thrashing.
+        return START_NOT_STICKY;
     }
 
-    /*
-     * Determines the best rxHw estimate using this priority:
-     *
-     * 1. AudioTrack.getLatency() via reflection  — full pipeline, most accurate
-     * 2. Previously saved value from SharedPreferences — instant, no measurement
-     * 3. savedHwLatencyMs from Intent (passed by MainActivity from SharedPrefs)
-     * 4. Zero — C++ engine will fall back to geometry + getTimestamp warmup
-     */
-    /*
-     * Determines the best rxHw estimate using this priority:
-     *
-     * 1. Saved mic-loopback calibration (CalibEngine result) — most accurate, user-verified
-     * 2. Saved measured value from a prior session (geometry or EMA-corrected)
-     * 3. savedHwLatencyMs extra from Intent (passed by MainActivity from SharedPrefs)
-     * 4. AudioTrack.getLatency() via reflection — full pipeline probe, no user action needed
-     * 5. AudioManager geometry estimate — rough (framesPerBuffer / sampleRate * 3 buffers)
-     * 6. Return 0 — C++ engine runs getTimestamp geometry + EMA corrects at runtime
-     *
-     * The per-device SharedPreferences key includes Build.MODEL + API level, so each
-     * Android model gets its own saved value and never pollutes another device's record.
-     */
     private long determineRxHwMs(Intent intent) {
-
-        // ── Source 1: mic-loopback calibration result ─────────────────────────────
-        // Written by CalibEngine on completion via LatencyPrefs.saveCalibHwLatency().
-        // Most accurate (±1 ms). Use it unconditionally when present.
+        // Source 1: mic-loopback calibration — most accurate
         if (LatencyPrefs.hasCalibValue(this)) {
             long calibMs = LatencyPrefs.getSavedCalibHwLatency(this);
             if (calibMs > 0) {
@@ -242,18 +259,14 @@ public class ReceiverService extends Service {
             }
         }
 
-        // ── Source 2: saved measured value from a prior session ───────────────────
-        // Written either by pollForMeasuredHwLatency() (geometry probe) or by
-        // LatencyPrefs.updateMeasuredFromSessionDrift() at session end.
+        // Source 2: saved measured value from a prior session
         long savedMs = LatencyPrefs.getSavedHwLatency(this);
         if (savedMs > 0) {
             Log.i(TAG, "rxHw source=saved  value=" + savedMs + " ms");
             return savedMs;
         }
 
-        // ── Source 3: value passed via Intent from MainActivity ───────────────────
-        // MainActivity reads SharedPrefs and puts the value in the Intent extra so
-        // the service has it even before SharedPrefs is available on this thread.
+        // Source 3: value passed via Intent from MainActivity
         if (intent != null) {
             long intentMs = intent.getLongExtra("savedHwLatencyMs", 0L);
             if (intentMs > 0) {
@@ -262,11 +275,7 @@ public class ReceiverService extends Service {
             }
         }
 
-        // ── Source 4: AudioTrack.getLatency() via reflection ──────────────────────
-        // Creates a minimal silent AudioTrack, queries its hidden getLatency() method
-        // which returns the full output pipeline depth in ms including the HAL.
-        // Stable across Android 5–14. Skipped on failure — reflection can throw on
-        // some OEM builds with strict reflection policies.
+        // Source 4: AudioTrack.getLatency() via reflection
         try {
             android.media.AudioTrack probe = new android.media.AudioTrack.Builder()
                     .setAudioAttributes(new android.media.AudioAttributes.Builder()
@@ -286,26 +295,21 @@ public class ReceiverService extends Service {
                     .setTransferMode(android.media.AudioTrack.MODE_STREAM)
                     .build();
 
-            java.lang.reflect.Method m = android.media.AudioTrack.class
-                    .getMethod("getLatency");
+            java.lang.reflect.Method m = android.media.AudioTrack.class.getMethod("getLatency");
             int reflectedMs = (int) m.invoke(probe);
             probe.release();
 
             if (reflectedMs > 10 && reflectedMs < 2000) {
                 Log.i(TAG, "rxHw source=reflection  value=" + reflectedMs + " ms");
-                // Save it so we don't need reflection on the next boot
                 LatencyPrefs.saveMeasuredHwLatency(this, reflectedMs);
                 return reflectedMs;
             }
-            Log.w(TAG, "rxHw reflection returned implausible value: " + reflectedMs + " ms — skipping");
+            Log.w(TAG, "rxHw reflection returned implausible value: " + reflectedMs + " ms");
         } catch (Exception e) {
             Log.w(TAG, "rxHw reflection probe failed: " + e.getMessage());
         }
 
-        // ── Source 5: AudioManager geometry estimate ──────────────────────────────
-        // framesPerBuffer / sampleRate * N_BUFFERS. N_BUFFERS is unknown; we use 3
-        // as a conservative estimate. Accurate to ±50% but gives a usable ballpark
-        // for a first-boot device where nothing else is available.
+        // Source 5: AudioManager geometry estimate
         try {
             android.media.AudioManager am =
                     (android.media.AudioManager) getSystemService(Context.AUDIO_SERVICE);
@@ -320,8 +324,7 @@ public class ReceiverService extends Service {
                     if (frames > 0 && rate > 0) {
                         long geometryMs = (long) frames * 3 * 1000L / rate;
                         if (geometryMs > 10 && geometryMs < 500) {
-                            Log.i(TAG, "rxHw source=geometry  frames=" + frames
-                                    + "  rate=" + rate + "  estimate=" + geometryMs + " ms");
+                            Log.i(TAG, "rxHw source=geometry  estimate=" + geometryMs + " ms");
                             return geometryMs;
                         }
                     }
@@ -331,9 +334,7 @@ public class ReceiverService extends Service {
             Log.w(TAG, "rxHw geometry estimate failed: " + e.getMessage());
         }
 
-        // ── Source 6: give up — let C++ handle it ─────────────────────────────────
-        // ReceiverEngine will run its own getTimestamp() geometry probe after stream
-        // open, and EMA drift correction will converge the remaining error at runtime.
+        // Source 6: give up — C++ engine self-measures at runtime
         Log.i(TAG, "rxHw source=none — C++ engine will self-measure at runtime");
         return 0L;
     }
@@ -341,26 +342,26 @@ public class ReceiverService extends Service {
     @Override
     public void onDestroy() {
         sInstance = null;
-        if (explicitStop_ && nativeHandle != 0) {
-            // ── EMA drift write-back ──────────────────────────────────────────────
-            // Read the EMA-converged drift BEFORE stopping the engine (the native
-            // handle is still valid here). If the drift is large enough, update the
-            // saved measured value so the next session starts from a better estimate.
-            long currentRxHwMs = NativeEngine.receiverGetMeasuredHwLatencyMs(nativeHandle);
-            long emaDriftMs     = NativeEngine.receiverGetEmaDriftMs(nativeHandle);
-            if (currentRxHwMs > 0) {
-                LatencyPrefs.updateMeasuredFromSessionDrift(this, currentRxHwMs, emaDriftMs);
-            }
 
+        if (nativeHandle != 0) {
+            if (explicitStop_) {
+                // User explicitly left — write back EMA drift for future sessions
+                long currentRxHwMs = NativeEngine.receiverGetMeasuredHwLatencyMs(nativeHandle);
+                long emaDriftMs    = NativeEngine.receiverGetEmaDriftMs(nativeHandle);
+                if (currentRxHwMs > 0) {
+                    LatencyPrefs.updateMeasuredFromSessionDrift(this, currentRxHwMs, emaDriftMs);
+                }
+                Log.i(TAG, "Engine torn down (explicit leave)");
+            } else {
+                Log.i(TAG, "Engine torn down (system kill or implicit stop)");
+            }
             NativeEngine.receiverStop(nativeHandle);
             NativeEngine.receiverDestroy(nativeHandle);
             nativeHandle = 0;
         }
 
-        // ── Release AudioFocus ────────────────────────────────────────────────
         abandonAudioFocus();
 
-        // ── Release WakeLock ──────────────────────────────────────────────────
         if (wakeLock_ != null && wakeLock_.isHeld()) {
             wakeLock_.release();
             Log.i(TAG, "WakeLock released");
@@ -370,7 +371,7 @@ public class ReceiverService extends Service {
         super.onDestroy();
     }
 
-    // ── AudioFocus helpers ────────────────────────────────────────────────────
+    // ── AudioFocus ────────────────────────────────────────────────────────────
 
     private void requestAudioFocus() {
         if (audioManager_ == null) return;
@@ -386,26 +387,17 @@ public class ReceiverService extends Service {
                 .setOnAudioFocusChangeListener(focusChange -> {
                     switch (focusChange) {
                         case AudioManager.AUDIOFOCUS_GAIN:
-                            // Regained focus — nothing to do on the receiver side.
-                            // The receiver doesn't control play/pause independently;
-                            // the sender drives it. Just log it.
                             Log.i(TAG, "AudioFocus: GAIN");
                             break;
-
                         case AudioManager.AUDIOFOCUS_LOSS:
-                            // Permanent focus loss (e.g. another music app).
-                            // Stop the receiver service — the user will restart it.
                             Log.i(TAG, "AudioFocus: LOSS — stopping receiver");
-                            stopSelf();
+                            LocalBinder b = getBinder();
+                            if (b != null) b.stopAndLeave();
+                            else stopSelf();
                             break;
-
                         case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT:
-                            Log.i(TAG, "AudioFocus: LOSS_TRANSIENT — flushing receiver immediately");
-                            if (nativeHandle != 0)
-                                NativeEngine.receiverFlushAndSilence(nativeHandle);
-                            break;
                         case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK:
-                            Log.i(TAG, "AudioFocus: LOSS_TRANSIENT_CAN_DUCK — flushing receiver (no duck)");
+                            Log.i(TAG, "AudioFocus: LOSS_TRANSIENT — flushing");
                             if (nativeHandle != 0)
                                 NativeEngine.receiverFlushAndSilence(nativeHandle);
                             break;
@@ -415,8 +407,7 @@ public class ReceiverService extends Service {
 
         int result = audioManager_.requestAudioFocus(audioFocusRequest_);
         audioFocusHeld_ = (result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED);
-        Log.i(TAG, "AudioFocus request result: "
-                + (audioFocusHeld_ ? "GRANTED" : "DELAYED/FAILED"));
+        Log.i(TAG, "AudioFocus: " + (audioFocusHeld_ ? "GRANTED" : "DELAYED/FAILED"));
     }
 
     private void abandonAudioFocus() {
@@ -449,25 +440,23 @@ public class ReceiverService extends Service {
         NotificationManager nm = getSystemService(NotificationManager.class);
         if (nm != null) nm.notify(NOTIF_ID, buildNotification(text));
     }
-    // ── Geometry poll — only runs on first-boot devices ───────────────────────
+
+    // ── Geometry poll — first-boot devices only ───────────────────────────────
+
     private void scheduleHwLatencyPoll() {
         hwPollHandler_.postDelayed(new Runnable() {
             @Override
             public void run() {
                 if (nativeHandle == 0 || hwLatencySaved_) return;
-
-                // Ask C++ for the measured hardware delay
                 long measuredMs = NativeEngine.receiverGetMeasuredHwLatencyMs(nativeHandle);
-
                 if (measuredMs > 0) {
                     LatencyPrefs.saveMeasuredHwLatency(ReceiverService.this, measuredMs);
                     hwLatencySaved_ = true;
                     Log.i(TAG, "First-boot geometry measurement saved: " + measuredMs + " ms");
                 } else {
-                    // C++ engine still warming up, check again in 500ms
                     hwPollHandler_.postDelayed(this, 500);
                 }
             }
-        }, 2500); // Wait 2.5s initially for the AAudio stream to stabilize
+        }, 2500);
     }
 }

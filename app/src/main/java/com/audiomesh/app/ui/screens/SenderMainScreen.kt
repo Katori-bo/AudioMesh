@@ -108,66 +108,75 @@ private fun SenderScreenContent(
     var seekDragging  by remember { mutableStateOf(false) }
     var seekPreviewMs by remember { mutableLongStateOf(0L) }
     var showDevicesSheet by remember { mutableStateOf(false) }
-    var showQueueSheet by remember { mutableStateOf(false) }
+    var showQueueSheet   by remember { mutableStateOf(false) }
 
     var vibrantColor by remember { mutableStateOf(RoleFull) }
     var palHex1      by remember { mutableStateOf("") }
     var palHex2      by remember { mutableStateOf("") }
 
-    // FIX #6 — LOCAL mode: start service AND set role in one shot.
-    // Old code did delay(1200) before setLocalRole, causing 10s perceived lag.
-    // Now we pass localOnly=true to the service which calls senderStartStreaming
-    // immediately, and then call setLocalRole as soon as the binder is ready
-    // (poll with 100ms retries, max 3s) instead of blindly waiting 1200ms.
+    // ── LOCAL mode: start service immediately ─────────────────────────────────
     LaunchedEffect(Unit) {
-        if (mode == SenderMode.LOCAL) {
-            // Only start service if not already running
-            if (SenderService.getBinder() == null) {
-                startSenderService(context, song, palHex1, palHex2, localOnly = true)
-                scope.launch {
-                    var waited = 0
-                    while (waited < 3000) {
-                        val b = SenderService.getBinder()
-                        if (b != null) {
-                            b.setLocalRole(role.name.lowercase(), 250f, 4000f)
-                            break
-                        }
-                        delay(100)
-                        waited += 100
+        if (mode == SenderMode.LOCAL && SenderService.getBinder() == null) {
+            startSenderService(context, song, palHex1, palHex2, localOnly = true)
+            scope.launch {
+                var waited = 0
+                while (waited < 3000) {
+                    val b = SenderService.getBinder()
+                    if (b != null) {
+                        b.setLocalRole(role.name.lowercase(), 250f, 4000f)
+                        break
                     }
+                    delay(100)
+                    waited += 100
                 }
             }
         }
     }
-// Track the last song.id we actually swapped to — skip swapTrack if
-    // the same song is already playing (e.g. returning via the miniplayer
-    // creates a fresh composition where LaunchedEffect fires but the binder
-    // is already streaming this exact track).
-// On first composition, pre-arm the guard so that if the service is
-    // already playing this song we never call swapTrack on it.
-    LaunchedEffect(Unit) {
-        val binder = SenderService.getBinder()
-        if (binder != null && nowPlaying.lastSwappedSongId == -1L) {
-            // Service is running — treat the current song as already swapped.
-            nowPlaying.lastSwappedSongId = song.id
-        }
-    }
 
+    // ── Track swap — the one LaunchedEffect that owns swapTrack ──────────────
+    //
+    // BUG HISTORY:
+    // Previously there were TWO LaunchedEffect blocks that both touched
+    // lastSwappedSongId:
+    //   (a) LaunchedEffect(Unit) — pre-armed the guard to song.id if binder != null
+    //   (b) LaunchedEffect(song.id) — called swapTrack if song.id != lastSwappedSongId
+    //
+    // These two effects raced on composition. On fresh entry (navigating from
+    // Library), both fire nearly simultaneously. If (a) ran first, it set
+    // lastSwappedSongId = song.id, so (b) saw them equal and skipped swapTrack.
+    // Result: new track never started playing. The user had to stop and re-select.
+    //
+    // FIX: one single LaunchedEffect keyed on song.id. The guard logic is:
+    //   • If service is running AND this is the same song that's already
+    //     streaming (lastSwappedSongId == song.id) → skip (returning via miniplayer)
+    //   • Otherwise → call swapTrack, update guard
+    //
+    // lastSwappedSongId is reset to -1L in NowPlayingViewModel.select() every
+    // time the user picks a new song from the Library, guaranteeing the first
+    // play always gets through.
     LaunchedEffect(song.id) {
         val binder = SenderService.getBinder()
-        if (binder != null && screenState == SenderScreenState.LIVE
-            && song.id != nowPlaying.lastSwappedSongId) {
+        if (binder != null && screenState == SenderScreenState.LIVE) {
+            if (song.id != nowPlaying.lastSwappedSongId) {
+                // New song — swap the track on the running engine
+                nowPlaying.lastSwappedSongId = song.id
+                binder.swapTrack(
+                    song.uri.toString(),
+                    song.title,
+                    song.artist,
+                    palHex1,
+                    palHex2,
+                )
+            }
+            // else: same song already playing (returned via miniplayer) — no-op
+        } else if (binder != null) {
+            // Service running but screen is in READY state (shouldn't normally
+            // happen, but guard anyway). Mark as pre-armed so GO LIVE doesn't
+            // double-swap.
             nowPlaying.lastSwappedSongId = song.id
-            binder.swapTrack(
-                song.uri.toString(),
-                song.title,
-                song.artist,
-                "",
-                "",
-            )
         }
 
-        // Then extract palette for the new song
+        // Extract album art palette for the current song regardless of swap
         val artSource = song.remoteArtUrl ?: song.albumArtUri ?: return@LaunchedEffect
         try {
             val loader  = ImageLoader(context)
@@ -179,7 +188,7 @@ private fun SenderScreenContent(
                 Palette.from(scaled).generate { palette ->
                     palette?.vibrantSwatch?.rgb?.let {
                         vibrantColor = Color(it)
-                        palHex1 = "#%06X".format(it and 0xFFFFFF)
+                        palHex1      = "#%06X".format(it and 0xFFFFFF)
                     }
                     palette?.dominantSwatch?.rgb?.let {
                         if (vibrantColor == RoleFull) vibrantColor = Color(it)
@@ -224,17 +233,23 @@ private fun SenderScreenContent(
                 modifier           = Modifier.fillMaxSize().blur(20.dp),
             )
         } else {
-            Box(Modifier.fillMaxSize()
-                .background(Color(SongRepository.fallbackColor(song.title))))
+            Box(
+                Modifier.fillMaxSize()
+                    .background(Color(SongRepository.fallbackColor(song.title)))
+            )
         }
 
-        Box(Modifier.fillMaxSize().background(
-            Brush.verticalGradient(listOf(
-                Color.Black.copy(alpha = 0.50f),
-                Color.Black.copy(alpha = 0.70f),
-                Color.Black.copy(alpha = 0.90f),
-            ))
-        ))
+        Box(
+            Modifier.fillMaxSize().background(
+                Brush.verticalGradient(
+                    listOf(
+                        Color.Black.copy(alpha = 0.50f),
+                        Color.Black.copy(alpha = 0.70f),
+                        Color.Black.copy(alpha = 0.90f),
+                    )
+                )
+            )
+        )
 
         Column(
             modifier = Modifier
@@ -246,23 +261,15 @@ private fun SenderScreenContent(
 
             Spacer(Modifier.height(16.dp))
 
-            // FIX #3 — Top bar always shows back button + role badge.
-            // Previously there was no back button here; the only exit was the
-            // stop button inside LiveControls. Now you can dismiss to miniplayer
-            // without stopping playback, and you can always change the role before
-            // going live (enabled = READY) or see it when live (enabled = false).
             Row(
-                modifier = Modifier.fillMaxWidth(),
+                modifier              = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
+                verticalAlignment     = Alignment.CenterVertically,
             ) {
                 BackButton(onClick = onBack)
 
-
                 RoleBadge(
                     role    = role,
-                    // FIX #3 — role is tappable in READY state only; in LIVE it
-                    // shows as an indicator. Sender can now pick role before going live.
                     enabled = screenState == SenderScreenState.READY,
                     onCycle = {
                         onRoleChange(when (role) {
@@ -331,8 +338,10 @@ private fun SenderScreenContent(
                         accentColor = vibrantColor,
                     ) {
                         screenState = SenderScreenState.LIVE
+                        // Mark this song as swapped BEFORE starting the service
+                        // so the LaunchedEffect(song.id) above doesn't double-fire
+                        nowPlaying.lastSwappedSongId = song.id
                         startSenderService(context, song, palHex1, palHex2, localOnly = mode == SenderMode.LOCAL)
-                        // FIX #6 — same fast-poll approach for MESH mode too
                         scope.launch {
                             var waited = 0
                             while (waited < 3000) {
@@ -417,15 +426,18 @@ private fun RoleBadge(role: SenderRole, enabled: Boolean, onCycle: () -> Unit) {
             .border(1.dp, role.accent.copy(alpha = 0.5f), RoundedCornerShape(20.dp))
             .then(if (enabled) Modifier.clickable(onClick = onCycle) else Modifier)
             .padding(horizontal = 14.dp, vertical = 7.dp),
-        verticalAlignment = Alignment.CenterVertically,
+        verticalAlignment     = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         Box(Modifier.size(7.dp).clip(CircleShape).background(role.accent))
-        Text(role.label, style = MaterialTheme.typography.labelSmall,
-            color = role.onAccent, fontSize = 11.sp, letterSpacing = 2.sp)
-        // FIX #3 — show "↕" arrow only when tappable (READY state)
+        Text(
+            role.label,
+            style         = MaterialTheme.typography.labelSmall,
+            color         = role.onAccent,
+            fontSize      = 11.sp,
+            letterSpacing = 2.sp,
+        )
         if (enabled) Text("↕", color = role.onAccent.copy(alpha = 0.5f), fontSize = 10.sp)
-        // In LIVE state show "· TX" so the badge still looks purposeful
         else Text("· TX", color = role.onAccent.copy(alpha = 0.45f), fontSize = 9.sp, letterSpacing = 1.sp)
     }
 }
@@ -462,7 +474,7 @@ private fun SeekSection(
             onValueChange         = onDrag,
             onValueChangeFinished = onDragEnd,
             modifier = Modifier.fillMaxWidth(),
-            colors   = SliderDefaults.colors(
+            colors = SliderDefaults.colors(
                 thumbColor         = Color.White,
                 activeTrackColor   = vibrantColor,
                 inactiveTrackColor = Color.White.copy(alpha = 0.2f),
@@ -483,9 +495,14 @@ private fun GoLiveButton(accentColor: Color, label: String = "GO LIVE", onClick:
             .padding(vertical = 18.dp),
         contentAlignment = Alignment.Center,
     ) {
-        Text(label, style = MaterialTheme.typography.labelSmall,
-            color = Color.White, fontSize = 14.sp, letterSpacing = 3.sp,
-            fontWeight = FontWeight.Bold)
+        Text(
+            label,
+            style      = MaterialTheme.typography.labelSmall,
+            color      = Color.White,
+            fontSize   = 14.sp,
+            letterSpacing = 3.sp,
+            fontWeight = FontWeight.Bold,
+        )
     }
 }
 
@@ -508,19 +525,25 @@ private fun QueueSheet(
                 .navigationBarsPadding()
         ) {
             Row(
-                modifier = Modifier.fillMaxWidth(),
+                modifier              = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
+                verticalAlignment     = Alignment.CenterVertically,
             ) {
-                Text("UP NEXT", style = MaterialTheme.typography.labelSmall, color = Color.White.copy(alpha = 0.40f), fontSize = 10.sp, letterSpacing = 3.sp)
+                Text(
+                    "UP NEXT",
+                    style         = MaterialTheme.typography.labelSmall,
+                    color         = Color.White.copy(alpha = 0.40f),
+                    fontSize      = 10.sp,
+                    letterSpacing = 3.sp,
+                )
                 if (queue.isNotEmpty()) {
                     Text(
                         "CLEAR ALL",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = Color(0xFF555555),
-                        fontSize = 10.sp,
+                        style         = MaterialTheme.typography.labelSmall,
+                        color         = Color(0xFF555555),
+                        fontSize      = 10.sp,
                         letterSpacing = 1.5.sp,
-                        modifier = Modifier
+                        modifier      = Modifier
                             .clip(RoundedCornerShape(6.dp))
                             .clickable { nowPlaying.clearQueue() }
                             .padding(horizontal = 8.dp, vertical = 4.dp),
@@ -529,17 +552,54 @@ private fun QueueSheet(
             }
             Spacer(Modifier.height(16.dp))
             if (queue.isEmpty()) {
-                Text("Queue is empty", style = MaterialTheme.typography.bodyMedium, color = Color(0xFF444444), modifier = Modifier.padding(vertical = 24.dp))
+                Text(
+                    "Queue is empty",
+                    style    = MaterialTheme.typography.bodyMedium,
+                    color    = Color(0xFF444444),
+                    modifier = Modifier.padding(vertical = 24.dp),
+                )
             } else {
                 LazyColumn {
                     itemsIndexed(queue) { index: Int, song: Song ->
-                        Row(modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                            Text("${index + 1}", style = MaterialTheme.typography.labelSmall, color = Color(0xFF444444), fontSize = 11.sp, modifier = Modifier.width(20.dp))
+                        Row(
+                            modifier              = Modifier.fillMaxWidth().padding(vertical = 10.dp),
+                            verticalAlignment     = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
+                            Text(
+                                "${index + 1}",
+                                style    = MaterialTheme.typography.labelSmall,
+                                color    = Color(0xFF444444),
+                                fontSize = 11.sp,
+                                modifier = Modifier.width(20.dp),
+                            )
                             Column(modifier = Modifier.weight(1f)) {
-                                Text(song.title, style = MaterialTheme.typography.bodyMedium, color = Color.White, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 13.sp)
-                                Text(song.artist, style = MaterialTheme.typography.bodySmall, color = Color(0xFF555555), maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 11.sp)
+                                Text(
+                                    song.title,
+                                    style      = MaterialTheme.typography.bodyMedium,
+                                    color      = Color.White,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines   = 1,
+                                    overflow   = TextOverflow.Ellipsis,
+                                    fontSize   = 13.sp,
+                                )
+                                Text(
+                                    song.artist,
+                                    style    = MaterialTheme.typography.bodySmall,
+                                    color    = Color(0xFF555555),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    fontSize = 11.sp,
+                                )
                             }
-                            Text("×", color = Color(0xFF444444), fontSize = 18.sp, modifier = Modifier.clickable { nowPlaying.removeFromQueue(index) }.padding(4.dp))
+                            Text(
+                                "×",
+                                color    = Color(0xFF444444),
+                                fontSize = 18.sp,
+                                modifier = Modifier
+                                    .clickable { nowPlaying.removeFromQueue(index) }
+                                    .padding(4.dp),
+                            )
                         }
                         HorizontalDivider(color = Color.White.copy(alpha = 0.06f), thickness = 0.5.dp)
                     }
@@ -566,9 +626,9 @@ private fun LiveControls(
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
 
         Row(
-            modifier = Modifier.fillMaxWidth(),
+            modifier              = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceEvenly,
-            verticalAlignment = Alignment.CenterVertically,
+            verticalAlignment     = Alignment.CenterVertically,
         ) {
             Box(
                 modifier = Modifier
@@ -578,9 +638,7 @@ private fun LiveControls(
                     .border(1.dp, Color.White.copy(alpha = 0.15f), CircleShape)
                     .clickable(onClick = onPrev),
                 contentAlignment = Alignment.Center,
-            ) {
-                Text("⏮", color = Color.White, fontSize = 18.sp)
-            }
+            ) { Text("⏮", color = Color.White, fontSize = 18.sp) }
 
             Box(
                 modifier = Modifier
@@ -594,10 +652,8 @@ private fun LiveControls(
                     Text("▶", color = Color.White, fontSize = 24.sp)
                 } else {
                     Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                        Box(Modifier.width(4.dp).height(22.dp)
-                            .clip(RoundedCornerShape(2.dp)).background(Color.White))
-                        Box(Modifier.width(4.dp).height(22.dp)
-                            .clip(RoundedCornerShape(2.dp)).background(Color.White))
+                        Box(Modifier.width(4.dp).height(22.dp).clip(RoundedCornerShape(2.dp)).background(Color.White))
+                        Box(Modifier.width(4.dp).height(22.dp).clip(RoundedCornerShape(2.dp)).background(Color.White))
                     }
                 }
             }
@@ -610,17 +666,15 @@ private fun LiveControls(
                     .border(1.dp, Color.White.copy(alpha = 0.15f), CircleShape)
                     .clickable(onClick = onNext),
                 contentAlignment = Alignment.Center,
-            ) {
-                Text("⏭", color = Color.White, fontSize = 18.sp)
-            }
+            ) { Text("⏭", color = Color.White, fontSize = 18.sp) }
         }
 
         Spacer(Modifier.height(16.dp))
 
         Row(
-            modifier = Modifier.fillMaxWidth(),
+            modifier              = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceEvenly,
-            verticalAlignment = Alignment.CenterVertically,
+            verticalAlignment     = Alignment.CenterVertically,
         ) {
             if (showDevices) {
                 Row(
@@ -630,17 +684,20 @@ private fun LiveControls(
                         .border(1.dp, vibrantColor.copy(alpha = 0.4f), RoundedCornerShape(24.dp))
                         .clickable(onClick = onDevicesTap)
                         .padding(horizontal = 16.dp, vertical = 10.dp),
-                    verticalAlignment = Alignment.CenterVertically,
+                    verticalAlignment     = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    Box(Modifier.size(7.dp).clip(CircleShape)
-                        .background(if (deviceCount > 0) vibrantColor else Color(0xFF444444)))
+                    Box(
+                        Modifier.size(7.dp).clip(CircleShape)
+                            .background(if (deviceCount > 0) vibrantColor else Color(0xFF444444))
+                    )
                     Text(
-                        text  = if (deviceCount == 0) "NO DEVICES"
+                        text      = if (deviceCount == 0) "NO DEVICES"
                         else "$deviceCount DEVICE${if (deviceCount != 1) "S" else ""}",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = if (deviceCount > 0) Color.White else Color(0xFF555555),
-                        fontSize = 11.sp, letterSpacing = 1.5.sp,
+                        style     = MaterialTheme.typography.labelSmall,
+                        color     = if (deviceCount > 0) Color.White else Color(0xFF555555),
+                        fontSize  = 11.sp,
+                        letterSpacing = 1.5.sp,
                     )
                 }
             }
@@ -653,9 +710,7 @@ private fun LiveControls(
                     .border(1.dp, Color.White.copy(alpha = 0.15f), CircleShape)
                     .clickable(onClick = onQueueTap),
                 contentAlignment = Alignment.Center,
-            ) {
-                Text("≡", color = Color.White, fontSize = 18.sp)
-            }
+            ) { Text("≡", color = Color.White, fontSize = 18.sp) }
 
             Box(
                 modifier = Modifier
@@ -666,8 +721,11 @@ private fun LiveControls(
                     .clickable(onClick = onStop),
                 contentAlignment = Alignment.Center,
             ) {
-                Box(Modifier.size(14.dp).clip(RoundedCornerShape(3.dp))
-                    .background(Color.White.copy(alpha = 0.8f)))
+                Box(
+                    Modifier.size(14.dp)
+                        .clip(RoundedCornerShape(3.dp))
+                        .background(Color.White.copy(alpha = 0.8f))
+                )
             }
         }
     }
@@ -678,8 +736,8 @@ private fun LiveControls(
 private fun startSenderService(
     context  : Context,
     song     : Song,
-    palHex1  : String = "",
-    palHex2  : String = "",
+    palHex1  : String  = "",
+    palHex2  : String  = "",
     localOnly: Boolean = false,
 ) {
     context.startForegroundService(

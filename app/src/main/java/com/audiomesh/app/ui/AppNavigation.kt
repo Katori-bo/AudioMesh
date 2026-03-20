@@ -19,14 +19,23 @@ import com.audiomesh.app.ui.screens.ReceiverMainScreen
 // ─────────────────────────────────────────────────────────────────────────────
 //  AppNavigation
 //
-//  Bug fixed here:
-//    currentRoute was read from navController.currentBackStackEntry?.destination?.route
-//    which is NOT reactive — it doesn't recompose when the back stack changes.
-//    This caused showMiniPlayer to stay false even after navigating back to
-//    LIBRARY, hiding the mini-player permanently until a full recompose.
+//  Session lifecycle contract:
 //
-//  Fix: use currentBackStackEntryAsState() which returns a State<NavBackStackEntry?>
-//    and triggers recomposition whenever the back stack changes.
+//  SENDER session:
+//    • Started when user taps GO LIVE in SenderMainScreen
+//    • Back button → Library, MiniPlayerBar persists, audio keeps playing
+//    • Stop button (■) → engine stops, MiniPlayerBar disappears
+//
+//  RECEIVER session:
+//    • Started when user taps JOIN in LibraryScreen or NearbyMeshBanner
+//    • Back button → Library, MiniPlayerBar persists, audio keeps playing
+//      (isReceiverActive stays true — MiniPlayerBar taps back to receiver screen)
+//    • LEAVE MESH → stopAndLeave() on binder + clearReceiver() on ViewModel
+//      (isReceiverActive becomes false — MiniPlayerBar disappears)
+//
+//  Key invariant: clearReceiver() is ONLY called from the LEAVE MESH path.
+//  Never call it on back-press. This keeps the MiniPlayerBar alive as a
+//  persistent beacon back to the receiver screen, matching Spotify behaviour.
 // ─────────────────────────────────────────────────────────────────────────────
 
 @Composable
@@ -43,7 +52,7 @@ fun AppNavigation(
     var isPlaying  by remember { mutableStateOf(false) }
     var durationMs by remember { mutableLongStateOf(0L) }
 
-    // Poll binder for isPlaying + duration
+    // Poll binder for isPlaying + duration — works for both sender and receiver
     LaunchedEffect(song, isReceiverActive) {
         while (true) {
             if (!isReceiverActive) {
@@ -63,12 +72,13 @@ fun AppNavigation(
         }
     }
 
-    // FIX: use currentBackStackEntryAsState() so currentRoute is reactive
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = navBackStackEntry?.destination?.route
 
-    // Show mini-player only on the library screen
-    val showMiniPlayer = song != null && currentRoute == Routes.LIBRARY
+    // Show MiniPlayerBar on Library screen when:
+    //   • Sender has a song selected (song != null), OR
+    //   • Receiver session is active (isReceiverActive)
+    val showMiniPlayer = (song != null || isReceiverActive) && currentRoute == Routes.LIBRARY
 
     Column(modifier = Modifier.fillMaxSize()) {
 
@@ -117,7 +127,21 @@ fun AppNavigation(
                     val senderIp = backStackEntry.arguments?.getString("senderIp") ?: ""
                     val role     = backStackEntry.arguments?.getString("role") ?: "FULL"
                     ReceiverMainScreen(
-                        onBack   = { navController.popBackStack() },
+                        onBack = {
+                            // ── Back button: keep audio playing, go to Library ─
+                            // Do NOT call nowPlaying.clearReceiver() here.
+                            // isReceiverActive stays true → MiniPlayerBar shows
+                            // → user can tap it to come back to this screen.
+                            navController.popBackStack()
+                        },
+                        onLeave = {
+                            // ── LEAVE MESH: stop engine, clear state, go to Library ──
+                            // This is the only path that calls clearReceiver().
+                            // The binder.stopAndLeave() call is made inside
+                            // ReceiverMainScreen before invoking this lambda.
+                            nowPlaying.clearReceiver()
+                            navController.popBackStack()
+                        },
                         senderIp = senderIp,
                         role     = role,
                     )
@@ -140,23 +164,36 @@ fun AppNavigation(
             }
         }
 
-        // MiniPlayerBar — shown at the bottom of the Library screen only
-        if (showMiniPlayer && song != null) {
+        // ── MiniPlayerBar ──────────────────────────────────────────────────────
+        if (showMiniPlayer) {
+            // In receiver mode song is null — synthesise a placeholder so the bar
+            // renders with the sender's IP as the subtitle.
+            val displaySong = song ?: com.audiomesh.app.data.Song(
+                id          = -1L,
+                title       = "AudioMesh",
+                artist      = receiverSenderIp ?: "Receiver",
+                album       = "",
+                durationMs  = 0L,
+                uri         = android.net.Uri.EMPTY,
+                albumArtUri = null,
+            )
             MiniPlayerBar(
-                song       = song!!,
+                song       = displaySong,
                 progressMs = progressMs,
                 durationMs = durationMs,
                 isPlaying  = isPlaying,
                 onTap = {
                     if (isReceiverActive && receiverSenderIp != null) {
+                        // Navigate back to receiver screen — service is still running
                         navController.navigate(
                             "${Routes.RECEIVER_MAIN}/$receiverSenderIp/$receiverRole"
                         )
                     } else {
-                        // Always pop back to the existing SenderMainScreen instance.
-                        // If it's not on the stack, push it — but mark that we are
-                        // returning to an already-playing session so swapTrack is skipped.
-                        val popped = navController.popBackStack(Routes.SENDER_MAIN, inclusive = false)
+                        // Navigate back to sender screen — pop to existing instance
+                        // so we don't create a duplicate and re-trigger swapTrack
+                        val popped = navController.popBackStack(
+                            Routes.SENDER_MAIN, inclusive = false
+                        )
                         if (!popped) {
                             nowPlaying.lastSwappedSongId = nowPlaying.song.value?.id ?: -1L
                             navController.navigate(Routes.SENDER_MAIN)
