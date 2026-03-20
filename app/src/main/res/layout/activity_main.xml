@@ -1,0 +1,308 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="24dp"
+        android:gravity="center_horizontal">
+
+        <TextView
+            android:text="AudioMesh"
+            android:textSize="28sp"
+            android:textStyle="bold"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="8dp"/>
+
+        <TextView
+            android:id="@+id/statusText"
+            android:text="Initialising…"
+            android:textSize="14sp"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="24dp"
+            android:gravity="center"/>
+
+        <!-- Sender -->
+        <TextView android:text="— SENDER —"
+            android:textStyle="bold"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="8dp"/>
+
+        <Button
+            android:id="@+id/btnSender"
+            android:text="Start as Sender"
+            android:layout_width="240dp"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="24dp"/>
+
+        <Button
+            android:id="@+id/btnPickMp3"
+            android:layout_width="240dp"
+            android:layout_height="wrap_content"
+            android:text="Select MP3 File"
+            android:visibility="gone"
+            android:layout_marginBottom="8dp" />
+
+        <TextView
+            android:id="@+id/tvMp3Name"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="No file selected"
+            android:textSize="12sp"
+            android:gravity="center"
+            android:visibility="gone"
+            android:layout_marginBottom="16dp"
+            android:textColor="#666666"/>
+
+        <!-- Receiver -->
+        <TextView android:text="— RECEIVER —"
+            android:textStyle="bold"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="8dp"/>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center"
+            android:layout_marginBottom="8dp">
+
+            <Button android:id="@+id/btnBass"
+                android:text="Bass"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="4dp"/>
+
+            <Button android:id="@+id/btnMid"
+                android:text="Mid"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="4dp"/>
+
+            <Button android:id="@+id/btnTreble"
+                android:text="Treble"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"/>
+        </LinearLayout>
+
+        <Button
+            android:id="@+id/btnFull"
+            android:text="Full Range (test)"
+            android:layout_width="240dp"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="8dp"/>
+
+        <TextView
+            android:id="@+id/tvAssignedRole"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Role: —"
+            android:textSize="12sp"
+            android:textColor="#666666"
+            android:layout_marginBottom="16dp"/>
+
+        <!-- ── Latency trim (receiver only) ──────────────────────────────────── -->
+        <LinearLayout
+            android:id="@+id/layoutLatency"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:visibility="gone"
+            android:layout_marginBottom="16dp">
+
+            <TextView
+                android:id="@+id/tvLatencyLabel"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Latency trim: 0 ms"
+                android:gravity="center"
+                android:textSize="13sp"
+                android:layout_marginBottom="4dp"/>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical">
+
+                <TextView
+                    android:text="-200"
+                    android:textSize="11sp"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginEnd="6dp"/>
+
+                <SeekBar
+                    android:id="@+id/seekLatency"
+                    android:layout_width="0dp"
+                    android:layout_weight="1"
+                    android:layout_height="wrap_content"
+                    android:max="1000"
+                    android:progress="200"/>
+
+                <TextView
+                    android:text="+200"
+                    android:textSize="11sp"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="6dp"/>
+            </LinearLayout>
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="+ = receiver plays later  |  − = receiver plays earlier"
+                android:gravity="center"
+                android:textSize="11sp"
+                android:textColor="#888888"
+                android:layout_marginTop="2dp"/>
+        </LinearLayout>
+        <!-- ─────────────────────────────────────────────────────────────────── -->
+        <!-- ── Switch Sender (receiver only) ─────────────────────────────────── -->
+        <LinearLayout
+            android:id="@+id/layoutSwitchSender"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center"
+            android:visibility="gone"
+            android:layout_marginBottom="8dp">
+
+            <Button
+                android:id="@+id/btnSwitchSender"
+                android:text="Switch Sender"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="4dp"
+                android:backgroundTint="#5C6BC0"
+                android:textColor="@android:color/white"/>
+
+            <Button
+                android:id="@+id/btnSwitchSenderManual"
+                android:text="Manual IP"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:backgroundTint="#78909C"
+                android:textColor="@android:color/white"/>
+
+        </LinearLayout>
+        <!-- ─────────────────────────────────────────────────────────────────── -->
+        <!-- ── Microphone loopback calibration ───────────────────────────────── -->
+        <!-- Visible always — user can calibrate before or after starting receiver -->
+        <Button
+            android:id="@+id/btnCalibrate"
+            android:text="Calibrate (Mic)"
+            android:layout_width="240dp"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="8dp"
+            android:backgroundTint="#1976D2"
+            android:textColor="@android:color/white"/>
+
+        <TextView
+            android:id="@+id/tvCalibStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:visibility="gone"
+            android:text=""
+            android:textSize="12sp"
+            android:textColor="#444444"
+            android:background="#F5F5F5"
+            android:padding="10dp"
+            android:layout_marginBottom="16dp"/>
+        <!-- ─────────────────────────────────────────────────────────────────── -->
+
+        <!-- ── Connected devices (sender only) ──────────────────────────────── -->
+        <LinearLayout
+            android:id="@+id/layoutDevices"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:visibility="gone"
+            android:background="#F0F4FF"
+            android:padding="10dp"
+            android:layout_marginBottom="8dp">
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Connected Devices"
+                android:textStyle="bold"
+                android:textSize="12sp"
+                android:layout_marginBottom="4dp"/>
+
+            <TextView
+                android:id="@+id/tvDeviceList"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="—"
+                android:textSize="12sp"
+                android:textColor="#333333"
+                android:fontFamily="monospace"/>
+
+        </LinearLayout>
+        <!-- ─────────────────────────────────────────────────────────────────── -->
+        <!-- ── Playback controls (sender only) ─────────────────────────────── -->
+        <LinearLayout
+            android:id="@+id/layoutPlaybackControls"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:visibility="gone"
+            android:background="#F0F4FF"
+            android:padding="12dp"
+            android:layout_marginBottom="8dp">
+
+            <!-- Position label -->
+            <TextView
+                android:id="@+id/tvTrackPosition"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="0:00 / 0:00"
+                android:gravity="center"
+                android:textSize="13sp"
+                android:layout_marginBottom="6dp"/>
+
+            <!-- Seek bar -->
+            <SeekBar
+                android:id="@+id/seekTrack"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:max="1000"
+                android:progress="0"
+                android:layout_marginBottom="10dp"/>
+
+            <!-- Pause / Resume button -->
+            <Button
+                android:id="@+id/btnPauseResume"
+                android:text="Pause"
+                android:backgroundTint="#388E3C"
+                android:textColor="@android:color/white"
+                android:layout_width="160dp"
+                android:layout_height="wrap_content"
+                android:layout_gravity="center"/>
+        </LinearLayout>
+        <!-- ─────────────────────────────────────────────────────────────────── -->
+
+        <!-- Stop -->
+        <Button
+            android:id="@+id/btnStop"
+            android:text="Stop"
+            android:backgroundTint="#D32F2F"
+            android:textColor="@android:color/white"
+            android:layout_width="240dp"
+            android:layout_height="wrap_content"/>
+
+    </LinearLayout>
+</ScrollView>

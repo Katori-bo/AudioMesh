@@ -1,0 +1,33 @@
+# Build outputs
+build/
+app/build/
+*.apk
+*.aab
+*.aar
+
+# Gradle
+.gradle/
+local.properties
+gradle/wrapper/gradle-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+.DS_Store
+
+# NDK / CMake
+.cxx/
+*.so
+*.o
+*.a
+
+# Third party (too large / not yours)
+app/src/main/cpp/third_party/
+app/src/main/cpp/includes/
+
+# Keys — NEVER commit these
+*.jks
+*.keystore
+google-services.json
+keystore.properties
+*.jks
